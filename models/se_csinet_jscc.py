@@ -1,0 +1,87 @@
+import torch
+import torch.nn as nn
+from models.se_module import SEBlock
+
+class AWGNChannel(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    @staticmethod
+    def power_normalize(x, eps=1e-8):
+        # x: [B, D]
+        power = torch.mean(x ** 2, dim=1, keepdim=True)  # 每个样本平均功率
+        x_norm = x / torch.sqrt(power + eps)
+        return x_norm
+
+    @staticmethod
+    def add_awgn(x, snr_db):
+        # x 已功率归一化，平均功率约1
+        snr_linear = 10 ** (snr_db / 10.0)
+        noise_var = 1.0 / snr_linear
+        noise_std = noise_var ** 0.5
+        noise = torch.randn_like(x) * noise_std
+        return x + noise
+
+    def forward(self, x_code, snr_db):
+        x_norm = self.power_normalize(x_code)
+        y = self.add_awgn(x_norm, snr_db)
+        return y
+
+
+class SECsiNetJSCC(nn.Module):
+    def __init__(self, h, w, cr, se_reduction=8):
+        super().__init__()
+        self.h = h
+        self.w = w
+        self.in_dim = 2 * h * w
+        self.comp_dim = self.in_dim // cr
+        self.out_dim = self.in_dim
+
+        # Encoder
+        self.encoder_conv = nn.Sequential(
+            nn.Conv2d(2, 2, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(2),
+            nn.ReLU(inplace=True)
+        )
+        self.encoder_se = SEBlock(2, reduction=se_reduction)
+        self.encoder_fc = nn.Linear(self.in_dim, self.comp_dim)
+
+        # Channel
+        self.channel = AWGNChannel()
+
+        # Decoder
+        self.decoder_fc = nn.Linear(self.comp_dim, self.out_dim)
+        self.refine = nn.Sequential(
+            nn.Conv2d(2, 8, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(8),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(8, 16, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(16),
+            nn.ReLU(inplace=True)
+        )
+        self.refine_se = SEBlock(16, reduction=se_reduction)
+        self.refine_out = nn.Sequential(
+            nn.Conv2d(16, 2, kernel_size=3, padding=1, bias=False),
+            nn.Tanh()
+        )
+
+    def encode(self, x):
+        x = self.encoder_conv(x)
+        x = self.encoder_se(x)
+        x = x.view(x.size(0), -1)
+        z = self.encoder_fc(x)
+        return z
+
+    def decode(self, z_noisy):
+        x_hat = self.decoder_fc(z_noisy)
+        x_hat = x_hat.view(x_hat.size(0), 2, self.h, self.w)
+        x_hat = self.refine(x_hat)
+        x_hat = self.refine_se(x_hat)
+        out = self.refine_out(x_hat)
+        return out
+
+    def forward(self, x, snr_db):
+        z = self.encode(x)
+        z_noisy = self.channel(z, snr_db)
+        out = self.decode(z_noisy)
+        return out
