@@ -35,5 +35,10 @@ runs/
 wandb/
 tensorboard/
 
+# AutoDL local data / outputs
+checkpoints
+logs
+data/processed
+
 # Large raw datasets
 data/raw/*.pt
